@@ -737,7 +737,7 @@ class HSGP(HSGPBase):
         if not isinstance(self.ls, VariableFactory):
             return self
 
-        if self.ls.dims != ():
+        if self.ls.dims not in ((), None):
             raise ValueError("The lengthscale prior must be scalar random variable.")
 
         return self
@@ -747,7 +747,7 @@ class HSGP(HSGPBase):
         if not isinstance(self.eta, VariableFactory):
             return self
 
-        if self.eta.dims != ():
+        if self.eta.dims not in ((), None):
             raise ValueError("The eta prior must be scalar random variable.")
 
         return self
