@@ -558,10 +558,40 @@ class EventAdditiveEffect(BaseModel):
         return dim_handler(total_effect, self.date_dim_name)
 
     def set_data(self, mmm: Model, model: pm.Model, X: xr.Dataset) -> None:
-        """Set the data for new predictions."""
+        """Set the data for new predictions.
+
+        When ``_prediction_start_date`` is set (by the caller before invoking
+        ``sample_posterior_predictive``), events whose snapped end date falls
+        strictly before that date are pushed to a very distant past so their
+        Gaussian basis contribution becomes negligible.  This prevents learned
+        event effects from bleeding into post-event test periods during
+        rolling-window validation.
+        """
         new_dates = pd.to_datetime(model.coords[self.date_dim_name])
 
-        new_data = {
+        new_data: dict = {
             "days": days_from_reference(new_dates, self.reference_date),
         }
+
+        pred_start = getattr(self, "_prediction_start_date", None)
+        if pred_start is not None:
+            import numpy as np
+
+            pred_start_day = days_from_reference(
+                pd.DatetimeIndex([pd.Timestamp(pred_start)]),
+                self.reference_date,
+            )[0]
+
+            start_diffs = days_from_reference(self.start_dates, self.reference_date)
+            end_diffs = days_from_reference(self.end_dates, self.reference_date)
+
+            past_mask = end_diffs < pred_start_day
+            FAR_PAST = np.int64(-999_999)
+            new_data[f"{self.prefix}_start_diff"] = np.where(
+                past_mask, FAR_PAST, start_diffs
+            )
+            new_data[f"{self.prefix}_end_diff"] = np.where(
+                past_mask, FAR_PAST, end_diffs
+            )
+
         pm.set_data(new_data=new_data, model=model)
