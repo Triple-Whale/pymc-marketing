@@ -104,8 +104,9 @@ Tips for custom components
   - In `set_data`, update the data variables when dates/dims change.
 """
 
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
+import numpy as np
 import pandas as pd
 import pymc as pm
 import xarray as xr
@@ -458,6 +459,15 @@ class EventAdditiveEffect(BaseModel):
         is "2025-01-01".
     date_dim_name : str
         The name of the date dimension in the model. Default is "date".
+    overlap_weights : np.ndarray, optional
+        Array of shape ``(n_model_dates, n_events)`` with values in [0, 1].
+        Each entry is ``overlap_days / period_days`` — the fraction of the
+        *period* that is covered by the event.  A week fully inside a multi-week
+        event gets 1.0; a week with only 2 event days gets 2/7.  When provided,
+        the per-event Gaussian basis effect is scaled by these weights so that
+        a partially-covered period gets a proportionally reduced effect.  When
+        ``None`` (default), all weights are implicitly 1.0, preserving the
+        original behaviour.
 
     """
 
@@ -466,6 +476,7 @@ class EventAdditiveEffect(BaseModel):
     effect: EventEffect
     reference_date: str = "2025-01-01"
     date_dim_name: str = "date"
+    overlap_weights: Optional[Any] = None
 
     def model_post_init(self, context: Any, /) -> None:
         """Post initialization of the model."""
@@ -519,6 +530,13 @@ class EventAdditiveEffect(BaseModel):
             dims=self.prefix,
         )
 
+        if self.overlap_weights is not None:
+            pm.Data(
+                f"{self.prefix}_overlap_weight",
+                np.asarray(self.overlap_weights, dtype="float64"),
+                dims=(self.date_dim_name, self.prefix),
+            )
+
     def create_effect(self, mmm: Model) -> pt.TensorVariable:
         """Create the event effect in the model.
 
@@ -548,6 +566,9 @@ class EventAdditiveEffect(BaseModel):
         X = create_basis_matrix(start_ref, end_ref)
         event_effect = self.effect.apply(X, name=self.prefix)
 
+        if f"{self.prefix}_overlap_weight" in model:
+            event_effect = event_effect * model[f"{self.prefix}_overlap_weight"]
+
         total_effect = pm.Deterministic(
             f"{self.prefix}_total_effect",
             event_effect.sum(axis=1),
@@ -575,8 +596,6 @@ class EventAdditiveEffect(BaseModel):
 
         pred_start = getattr(self, "_prediction_start_date", None)
         if pred_start is not None:
-            import numpy as np
-
             pred_start_day = days_from_reference(
                 pd.DatetimeIndex([pd.Timestamp(pred_start)]),
                 self.reference_date,
@@ -593,5 +612,17 @@ class EventAdditiveEffect(BaseModel):
             new_data[f"{self.prefix}_end_diff"] = np.where(
                 past_mask, FAR_PAST, end_diffs
             )
+
+        overlap_weight_key = f"{self.prefix}_overlap_weight"
+        if overlap_weight_key in model:
+            recompute_fn = getattr(self, "_recompute_overlap_weights", None)
+            if recompute_fn is not None:
+                new_data[overlap_weight_key] = recompute_fn(new_dates)
+            else:
+                n_dates = len(new_dates)
+                n_events = len(self.df_events)
+                new_data[overlap_weight_key] = np.ones(
+                    (n_dates, n_events), dtype="float64"
+                )
 
         pm.set_data(new_data=new_data, model=model)

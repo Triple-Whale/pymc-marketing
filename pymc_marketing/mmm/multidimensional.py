@@ -469,6 +469,7 @@ class MMM(RegressionModelBuilder):
         df_events: pd.DataFrame,
         prefix: str,
         effect: EventEffect,
+        overlap_weights=None,
     ) -> None:
         """Add event effects to the model.
 
@@ -485,6 +486,10 @@ class MMM(RegressionModelBuilder):
             The prefix to use for the event effect and associated variables.
         effect : EventEffect
             The event effect to apply.
+        overlap_weights : np.ndarray, optional
+            Shape ``(n_model_dates, n_events)`` with values in [0, 1].
+            Fraction of each *period* covered by the event (``overlap_days /
+            period_days``).  When ``None``, all weights default to 1.0.
 
         Raises
         ------
@@ -501,6 +506,7 @@ class MMM(RegressionModelBuilder):
             df_events=df_events,
             prefix=prefix,
             effect=effect,
+            overlap_weights=overlap_weights,
         )
         self.mu_effects.append(event_effect)
 
