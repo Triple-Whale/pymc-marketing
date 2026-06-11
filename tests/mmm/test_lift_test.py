@@ -573,11 +573,15 @@ def test_adds_date_column_if_missing(dummy_mmm_model):
 def test_add_cost_per_target_potentials(dummy_mmm_model):
     model = dummy_mmm_model
 
-    # Create a simple constant cost_per_target tensor over (date, channel)
+    # Constant spend/contribution tensors over (date, channel) giving an
+    # aggregate cost-per-target of 30 for every channel.
     dates = model.model.coords["date"]
     channels = model.model.coords["channel"]
-    const_cpt = pt.as_tensor_variable(
+    spend = pt.as_tensor_variable(
         np.full((len(dates), len(channels)), 30.0, dtype=float)
+    )
+    contribution = pt.as_tensor_variable(
+        np.ones((len(dates), len(channels)), dtype=float)
     )
 
     # Calibration DataFrame: rows map to existing channels (no extra dims in this fixture)
@@ -593,13 +597,86 @@ def test_add_cost_per_target_potentials(dummy_mmm_model):
     add_cost_per_target_potentials(
         calibration_df=calibration_df,
         model=model.model,
-        cpt_value=const_cpt,
+        spend_value=spend,
+        contribution_value=contribution,
         name_prefix="cpt_calibration",
     )
 
     # Check aggregated potential was added with the expected base name
     pot_names = [getattr(p, "name", None) for p in model.model.potentials]
     assert "cpt_calibration" in pot_names
+
+    # The tensors are constant, so the potential can be evaluated directly:
+    # row 1 is exactly on target (zero penalty); row 2 is log(30/45) away
+    # with relative sigma 3/45.
+    pot = model.model.potentials[pot_names.index("cpt_calibration")]
+    expected_row2 = -(np.log(30.0 / 45.0) ** 2) / (2 * (3.0 / 45.0) ** 2)
+    np.testing.assert_allclose(pot.eval(), expected_row2, rtol=1e-9)
+
+
+def test_add_cost_per_target_potentials_uses_ratio_of_sums(dummy_mmm_model):
+    """Aggregate CPT must be sum(spend)/sum(contribution), not the mean of
+    per-date ratios. With spend [30, 0, ...] and contribution [1, 9, ...] the
+    ratio of sums is 3 while the mean of ratios is 15; a target of 3 must
+    therefore yield a zero penalty."""
+    model = dummy_mmm_model
+    dates = model.model.coords["date"]
+    channels = model.model.coords["channel"]
+
+    spend_np = np.zeros((len(dates), len(channels)), dtype=float)
+    contribution_np = np.full((len(dates), len(channels)), 1e-9, dtype=float)
+    spend_np[0, :] = 30.0
+    contribution_np[0, :] = 1.0
+    contribution_np[1, :] = 9.0
+
+    calibration_df = pd.DataFrame(
+        {
+            "channel": [channels[0]],
+            "cost_per_target": [3.0],
+            "sigma": [0.3],
+        }
+    )
+
+    add_cost_per_target_potentials(
+        calibration_df=calibration_df,
+        model=model.model,
+        spend_value=pt.as_tensor_variable(spend_np),
+        contribution_value=pt.as_tensor_variable(contribution_np),
+        name_prefix="cpt_ratio_of_sums",
+    )
+
+    pot_names = [getattr(p, "name", None) for p in model.model.potentials]
+    pot = model.model.potentials[pot_names.index("cpt_ratio_of_sums")]
+    np.testing.assert_allclose(pot.eval(), 0.0, atol=1e-6)
+
+
+def test_add_cost_per_target_potentials_rejects_non_positive_targets(dummy_mmm_model):
+    model = dummy_mmm_model
+    dates = model.model.coords["date"]
+    channels = model.model.coords["channel"]
+    spend = pt.as_tensor_variable(
+        np.full((len(dates), len(channels)), 30.0, dtype=float)
+    )
+    contribution = pt.as_tensor_variable(
+        np.ones((len(dates), len(channels)), dtype=float)
+    )
+
+    calibration_df = pd.DataFrame(
+        {
+            "channel": [channels[0]],
+            "cost_per_target": [0.0],
+            "sigma": [1.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        add_cost_per_target_potentials(
+            calibration_df=calibration_df,
+            model=model.model,
+            spend_value=spend,
+            contribution_value=contribution,
+            name_prefix="cpt_invalid_target",
+        )
 
 
 def test_add_cost_per_target_potentials_missing_columns(dummy_mmm_model):
@@ -608,8 +685,11 @@ def test_add_cost_per_target_potentials_missing_columns(dummy_mmm_model):
     channels = model.coords["channel"]
 
     dates = model.coords["date"]
-    const_cpt = pt.as_tensor_variable(
+    spend = pt.as_tensor_variable(
         np.full((len(dates), len(channels)), 30.0, dtype=float)
+    )
+    contribution = pt.as_tensor_variable(
+        np.ones((len(dates), len(channels)), dtype=float)
     )
 
     # Test missing 'sigma' column
@@ -626,7 +706,8 @@ def test_add_cost_per_target_potentials_missing_columns(dummy_mmm_model):
         add_cost_per_target_potentials(
             calibration_df=calibration_df,
             model=model,
-            cpt_value=const_cpt,
+            spend_value=spend,
+            contribution_value=contribution,
             name_prefix="cpt_calibration",
         )
 
@@ -640,7 +721,8 @@ def test_add_cost_per_target_potentials_missing_columns(dummy_mmm_model):
         add_cost_per_target_potentials(
             calibration_df=calibration_df_minimal,
             model=model,
-            cpt_value=const_cpt,
+            spend_value=spend,
+            contribution_value=contribution,
             name_prefix="cpt_calibration",
         )
 
@@ -682,11 +764,14 @@ def test_add_cost_per_target_potentials_with_posterior_predictive_out_of_sample(
     )
     mmm.build_model(X_train, y_train)
 
-    # Create a cost_per_target tensor over (date, channel)
+    # Create spend/contribution tensors over (date, channel)
     dates = mmm.model.coords["date"]
     channels = mmm.model.coords["channel"]
-    const_cpt = pt.as_tensor_variable(
+    spend = pt.as_tensor_variable(
         np.full((len(dates), len(channels)), 25.0, dtype=float)
+    )
+    contribution = pt.as_tensor_variable(
+        np.ones((len(dates), len(channels)), dtype=float)
     )
 
     # Calibration DataFrame with targets
@@ -702,7 +787,8 @@ def test_add_cost_per_target_potentials_with_posterior_predictive_out_of_sample(
     add_cost_per_target_potentials(
         calibration_df=calibration_df,
         model=mmm.model,
-        cpt_value=const_cpt,
+        spend_value=spend,
+        contribution_value=contribution,
         name_prefix="cpt_calibration",
     )
 

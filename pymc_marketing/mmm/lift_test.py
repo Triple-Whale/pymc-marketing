@@ -785,18 +785,38 @@ def add_cost_per_target_potentials(
     calibration_df: pd.DataFrame,
     *,
     model: pm.Model | None = None,
-    cpt_value: TensorVariable,
+    spend_value: TensorVariable,
+    contribution_value: TensorVariable,
     target_column: str = "cost_per_target",
     name_prefix: str = "cpt_calibration",
     get_indices: Callable[[pd.DataFrame, pm.Model], Indices] = exact_row_indices,
 ) -> None:
     """Add ``pm.Potential`` penalties to calibrate cost-per-target.
 
-    For each row, we compute the mean of ``cpt_variable_name`` across the date
-    dimension for the specified (dims, channel) slice and add a soft quadratic
-    penalty:
+    For each row, we compute the aggregate cost-per-target of the specified
+    (dims, channel) slice as the ratio of sums over the date dimension:
 
-    ``penalty = - |cpt_mean - target|^2 / (2 * sigma^2)``.
+    ``cpt = sum(spend) / sum(contribution)``
+
+    and add a soft quadratic penalty on the log scale:
+
+    ``penalty = - (log(cpt) - log(target))^2 / (2 * sigma_log^2)``
+
+    where ``sigma_log = sigma / target`` (i.e. ``sigma`` keeps its historical
+    meaning of an absolute tolerance around the target, which on the log scale
+    becomes the relative tolerance ``sigma / target``).
+
+    The ratio of sums is used (rather than the mean of per-date ratios) so the
+    constrained quantity equals the window-aggregate cost-per-target users
+    reason about. Per-date ratios are degenerate: dates with zero spend pull
+    the mean toward zero and dates with near-zero contribution explode it,
+    letting the sampler satisfy the penalty while the aggregate CPT drifts
+    arbitrarily far from the target.
+
+    The log scale makes the penalty symmetric in *ratio* terms and unbounded
+    in both directions. A quadratic penalty on the raw CPT scale caps the cost
+    of CPT -> 0 (i.e. ROAS -> infinity) at ``target^2 / (2 * sigma^2)`` nats,
+    which a strong likelihood can simply pay.
 
     Parameters
     ----------
@@ -807,8 +827,12 @@ def add_cost_per_target_potentials(
         CPT variable (excluding ``date``).
     model : pm.Model, optional
         Model containing the cost-per-target tensor. If None, uses the current model context.
-    cpt_value : TensorVariable
-        Tensor representing cost-per-target values over the model coordinates.
+    spend_value : TensorVariable
+        Tensor of spend (original units) over the model coordinates,
+        shaped like ``channel_data``.
+    contribution_value : TensorVariable
+        Tensor of channel contributions in original scale over the model
+        coordinates, shaped like ``channel_data``.
     target_column : str
         Column in ``calibration_df`` containing the calibration targets.
     name_prefix : str
@@ -820,7 +844,7 @@ def add_cost_per_target_potentials(
     --------
     .. code-block:: python
 
-        cpt_tensor = pt.as_tensor_variable(
+        spend_tensor = pt.as_tensor_variable(
             np.full((len(dates), len(geo), len(channels)), 30.0, dtype=float)
         )
 
@@ -836,7 +860,8 @@ def add_cost_per_target_potentials(
         add_cost_per_target_potentials(
             calibration_df=calibration_df,
             model=mmm.model,
-            cpt_value=cpt_tensor,
+            spend_value=spend_tensor,
+            contribution_value=mmm.model["channel_contribution_original_scale"],
             name_prefix="cpt_calibration",
         )
     """
@@ -867,11 +892,21 @@ def add_cost_per_target_potentials(
     )
     sigmas: npt.NDArray[np.float64] = calibration_df["sigma"].to_numpy(dtype=float)
 
+    if np.any(targets <= 0) or np.any(sigmas <= 0):
+        raise ValueError(
+            f"'{target_column}' and 'sigma' must be strictly positive for the "
+            "log-scale cost-per-target penalty."
+        )
+
     with current_model:
-        # Compute mean over the date dimension once
-        cpt_full = cpt_value
+        # Aggregate over the date dimension as a ratio of sums so the
+        # constrained quantity is the window-level cost-per-target.
         date_axis = cpt_dims.index("date")
-        cpt_mean = pt.mean(cpt_full, axis=date_axis)
+        spend_sum = pt.sum(spend_value, axis=date_axis)
+        contribution_sum = pt.clip(
+            pt.sum(contribution_value, axis=date_axis), 1e-12, np.inf
+        )
+        cpt_agg = spend_sum / contribution_sum
 
         # Build advanced indexing arrays for remaining dims (including channel),
         # preserving the order present in cpt_dims (excluding date)
@@ -881,10 +916,12 @@ def add_cost_per_target_potentials(
             if dim != "date"
         ]
 
-        # Gather the cpt mean for each calibration row as a vector
-        gathered_cpt = cpt_mean[tuple(indexers)]
+        # Gather the aggregate cpt for each calibration row as a vector
+        gathered_cpt = pt.clip(cpt_agg[tuple(indexers)], 1e-12, np.inf)
 
-        # Vectorized quadratic penalties and single aggregated Potential
-        deviation = pt.abs(gathered_cpt - targets)
-        penalties = -(deviation**2) / (2 * (sigmas**2))
+        # Quadratic penalty on the log scale; sigma is interpreted relative
+        # to the target (sigma_log = sigma / target).
+        sigma_logs = sigmas / targets
+        deviation = pt.log(gathered_cpt) - np.log(targets)
+        penalties = -(deviation**2) / (2 * (sigma_logs**2))
         pm.Potential(name_prefix, pt.sum(penalties))

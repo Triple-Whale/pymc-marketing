@@ -2225,11 +2225,15 @@ class MMM(RegressionModelBuilder):
     ) -> None:
         """Calibrate cost-per-target using constraints via ``pm.Potential``.
 
-        This adds a deterministic ``cpt_variable_name`` computed as
-        ``channel_data_spend / channel_contribution_original_scale`` and creates
-        per-row penalty terms based on ``calibration_data`` using a quadratic penalty:
+        For each calibration row the aggregate cost-per-target of the
+        (dims, channel) slice is computed as a ratio of sums over dates,
+        ``sum(spend) / sum(channel_contribution_original_scale)``, and a
+        quadratic penalty is applied on the log scale:
 
-        ``penalty = - |cpt_mean - target|^2 / (2 * sigma^2)``.
+        ``penalty = - (log(cpt) - log(target))^2 / (2 * (sigma / target)^2)``.
+
+        See :func:`pymc_marketing.mmm.lift_test.add_cost_per_target_potentials`
+        for the rationale.
 
         Parameters
         ----------
@@ -2241,10 +2245,10 @@ class MMM(RegressionModelBuilder):
             DataFrame with rows specifying calibration targets. Must include:
               - ``channel``: channel name in ``self.channel_columns``
               - ``cost_per_target``: desired CPT value
-              - ``sigma``: accepted deviation; larger => weaker penalty
+              - ``sigma``: accepted deviation around the target (same units as
+                the target; ``sigma / target`` is the relative tolerance used
+                by the log-scale penalty); larger => weaker penalty
             and one column per dimension in ``self.dims``.
-        cpt_variable_name : str
-            Name for the cost-per-target Deterministic in the model.
         name_prefix : str
             Prefix to use for generated potential names.
 
@@ -2334,15 +2338,11 @@ class MMM(RegressionModelBuilder):
                     "`add_original_scale_contribution_variable` before adding the cost-per-target calibration."
                 )
 
-            denom = pt.clip(
-                self.model["channel_contribution_original_scale"], 1e-12, np.inf
-            )
-            cpt_tensor = spend_tensor / denom
-
         add_cost_per_target_potentials(
             calibration_df=calibration_data,
             model=self.model,
-            cpt_value=cpt_tensor,
+            spend_value=spend_tensor,
+            contribution_value=self.model["channel_contribution_original_scale"],
             name_prefix=name_prefix,
         )
 
